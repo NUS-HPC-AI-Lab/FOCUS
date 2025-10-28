@@ -1,4 +1,4 @@
-# FOCUS: Frame-Optimistic Confidence Upper-bound Selection
+# FOCUS: Efficient Keyframe Selection for Long Video Understanding
 
 ![FOCUS Framework](fig/framework.png)
 
