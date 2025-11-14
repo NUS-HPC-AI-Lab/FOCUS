@@ -1,7 +1,7 @@
 """
 FOCUS Data Processing and I/O Module
 
-This module handles data processing, video loading, similarity computation, and result output
+This module handles data processing, video loading, and result output
 for the FOCUS keyframe extraction algorithm.
 """
 
@@ -21,222 +21,67 @@ from PIL import Image
 from tqdm import tqdm
 
 from lavis.models import load_model_and_preprocess
-from focus import run_focus_algorithm
+from focus import FOCUS
 
 
 # ============================================================================
 # Video Processing Functions
 # ============================================================================
 
-def blip_batch_similarity(frame_indices: List[int], vr: VideoReader, 
-                         vis_processors, model, device: str, txt, batch_size: int) -> List[float]:
+def create_blip_similarity_fn(vr: VideoReader, vis_processors, text_processors, 
+                              model, device: str, batch_size: int):
     """
-    Compute BLIP similarity scores for a batch of frame indices.
+    Create a BLIP-based similarity function for FOCUS algorithm.
+    
+    This function creates a closure that captures the BLIP model and processors,
+    providing a clean interface for the FOCUS algorithm.
     
     Args:
-        frame_indices: List of frame indices to process
         vr: VideoReader object
         vis_processors: Vision processors for BLIP
+        text_processors: Text processors for BLIP
         model: BLIP model
         device: Device to run inference on
-        txt: Processed text input
         batch_size: Batch size for processing
         
     Returns:
-        List of similarity scores
+        Function with signature (video, query, frame_indices) -> similarity_scores
     """
-    similarities = []
-    for i in range(0, len(frame_indices), batch_size):
-        batch_indices = frame_indices[i:i+batch_size]
-        batch_images = []
-        for idx in batch_indices:
-            raw_image = vr[idx].numpy()
-            raw_image = Image.fromarray(raw_image)
-            img = vis_processors["eval"](raw_image).unsqueeze(0)
-            batch_images.append(img)
-        if batch_images:
-            batch_tensor = torch.cat(batch_images, dim=0).to(device)
-            with torch.no_grad():
-                blip_output, _ = model({"image": batch_tensor, "text_input": txt}, match_head="itm-e")
-                blip_scores = torch.nn.functional.softmax(blip_output, dim=1)
-                batch_similarities = [blip_scores[j, 1].item() for j in range(len(batch_indices))]
-                similarities.extend(batch_similarities)
-    return similarities
-
-
-def process_single_video(vr: VideoReader, text: str, vis_processors, text_processors, 
-                       model, device: str, args, rng: np.random.Generator) -> Tuple[List[int], Dict]:
-    """
-    Process a single video with FOCUS algorithm.
-    
-    Args:
-        vr: VideoReader object
-        text: Query text
-        vis_processors: Vision processors
-        text_processors: Text processors
-        model: BLIP model
-        device: Device to run inference on
-        args: Algorithm arguments
-        rng: Random number generator
+    def similarity_fn(video: VideoReader, query: str, frame_indices: List[int]) -> List[float]:
+        """
+        Compute BLIP similarity scores for a batch of frame indices.
         
-    Returns:
-        Tuple of (selected_frames, sampling_details)
-    """
-    from focus import setup_arms, coarse_sampling_in_arms, fine_sampling_in_arms
-    
-    total_frames = len(vr)
-    fps = float(vr.get_avg_fps())
-    video_duration = float(total_frames) / max(1.0, fps)
-
-    # Adaptive min-gap calculation
-    avg_spacing_sec = video_duration / max(1, args.num_keyframes)
-    if avg_spacing_sec <= float(args.disable_gap_below_sec):
-        auto_min_gap_sec = 0.0
-    else:
-        gap_from_ratio = float(args.gap_ratio_of_avg) * avg_spacing_sec
-        auto_min_gap_sec = min(gap_from_ratio, float(args.min_gap_sec))
-
-    txt = text_processors["eval"](text)
-
-    # Setup arms and perform coarse sampling
-    coarse_stride = max(1, int(round(args.coarse_every_sec * fps)))
-    desired_coarse = max(args.min_coarse_segments, int(np.ceil(video_duration / max(1e-6, args.coarse_every_sec))))
-    if desired_coarse > 0:
-        coarse_stride = max(1, int(np.floor(total_frames / desired_coarse)))
-
-    arms = setup_arms(total_frames, coarse_stride)
-    all_coarse_indices = coarse_sampling_in_arms(arms, args.extra_samples_per_region, rng)
-    all_coarse_similarities = blip_batch_similarity(all_coarse_indices, vr, vis_processors, model, device, txt, args.batch_size)
-
-    # Fine sampling
-    fine_stride = max(1, int(round(args.fine_every_sec * fps)))
-    fine_stride = min(fine_stride, coarse_stride)
-
-    if args.region_half_window_sec is None:
-        effective_coarse_sec = max(1e-6, video_duration / max(1, desired_coarse))
-        region_half_window_sec = max(1.0 / fps, effective_coarse_sec / 2.0)
-    else:
-        region_half_window_sec = args.region_half_window_sec
-    region_half_window = max(1, int(round(region_half_window_sec * fps)))
-
-    # Run FOCUS algorithm
-    selected_frames, arms, arm_selection_probs, arm_selection_counts = run_focus_algorithm(
-        total_frames=total_frames,
-        fps=fps,
-        coarse_every_sec=args.coarse_every_sec,
-        fine_every_sec=args.fine_every_sec,
-        zoom_ratio=args.zoom_ratio,
-        final_min_arms=args.final_min_arms,
-        final_max_arms=args.final_max_arms,
-        min_coarse_segments=args.min_coarse_segments,
-        min_zoom_segments=args.min_zoom_segments,
-        region_half_window_sec=region_half_window_sec,
-        extra_samples_per_region=args.extra_samples_per_region,
-        min_variance_threshold=args.min_variance_threshold,
-        fine_uniform_ratio=args.fine_uniform_ratio,
-        interpolation_method=args.interpolation_method,
-        all_coarse_indices=all_coarse_indices,
-        all_coarse_similarities=all_coarse_similarities,
-        all_fine_indices=[],  # Fine sampling will be handled internally
-        all_fine_similarities=[],
-        rng=rng,
-        k=args.num_keyframes,
-        top_ratio=args.top_ratio,
-        min_gap_sec=auto_min_gap_sec,
-        temperature=args.temperature
-    )
-
-    # Prepare sampling details
-    sampling_details = prepare_sampling_details(
-        all_coarse_indices, all_coarse_similarities,
-        [], [],  # Fine sampling details will be empty for now
-        arms, selected_frames, total_frames, fps, len(all_coarse_indices),
-        arm_selection_probs, arm_selection_counts
-    )
-
-    return selected_frames, sampling_details
-
-
-def prepare_sampling_details(coarse_indices: List[int], coarse_similarities: List[float],
-                           fine_indices: List[int], fine_similarities: List[float],
-                           arms: List[Dict], selected_frames: List[int],
-                           total_frames: int, fps: float, budget_used: int,
-                           arm_selection_probs: List[float], arm_selection_counts: List[int]) -> Dict:
-    """
-    Prepare detailed sampling information for export.
-    """
-    def create_temporal_order(frame_indices: List[int], similarities: List[float], fps: float) -> List[Dict]:
-        """Create temporal order list with timestamps."""
-        if not frame_indices:
-            return []
+        Args:
+            video: VideoReader object (same as vr from closure)
+            query: Query text
+            frame_indices: List of frame indices to compute similarity for
+            
+        Returns:
+            List of similarity scores
+        """
+        txt = text_processors["eval"](query)
+        similarities = []
         
-        combined = list(zip(frame_indices, similarities))
-        combined.sort(key=lambda x: x[0])
+        for i in range(0, len(frame_indices), batch_size):
+            batch_indices = frame_indices[i:i+batch_size]
+            batch_images = []
+            for idx in batch_indices:
+                raw_image = vr[idx].numpy()
+                raw_image = Image.fromarray(raw_image)
+                img = vis_processors["eval"](raw_image).unsqueeze(0)
+                batch_images.append(img)
+            
+            if batch_images:
+                batch_tensor = torch.cat(batch_images, dim=0).to(device)
+                with torch.no_grad():
+                    blip_output, _ = model({"image": batch_tensor, "text_input": txt}, match_head="itm-e")
+                    blip_scores = torch.nn.functional.softmax(blip_output, dim=1)
+                    batch_similarities = [blip_scores[j, 1].item() for j in range(len(batch_indices))]
+                    similarities.extend(batch_similarities)
         
-        temporal_order = []
-        for frame_idx, score in combined:
-            temporal_order.append({
-                "frame_idx": int(frame_idx),
-                "score": float(score),
-                "timestamp": float(frame_idx / max(1.0, fps))
-            })
-        return temporal_order
+        return similarities
     
-    # Prepare coarse sampling info
-    coarse_sampling = {
-        "frame_indices": [int(idx) for idx in coarse_indices],
-        "relevance_scores": [float(score) for score in coarse_similarities],
-        "temporal_order": create_temporal_order(coarse_indices, coarse_similarities, fps),
-        "budget_used": int(len(coarse_indices))
-    }
-    
-    # Prepare fine sampling info
-    fine_sampling = {
-        "frame_indices": [int(idx) for idx in fine_indices],
-        "relevance_scores": [float(score) for score in fine_similarities],
-        "temporal_order": create_temporal_order(fine_indices, fine_similarities, fps),
-        "budget_used": int(len(fine_indices))
-    }
-    
-    # Prepare arms info
-    arms_info = {
-        "total_arms": len(arms),
-        "frames_per_arm": total_frames // max(1, len(arms)),
-        "arms": []
-    }
-    
-    for i, arm in enumerate(arms):
-        times_selected = arm_selection_counts[i] if i < len(arm_selection_counts) else 0
-        arm_info = {
-            "arm_id": int(arm['arm_id']),
-            "start_frame": int(arm['start']),
-            "end_frame": int(arm['end']),
-            "focus_score": float(arm['focus_score']),
-            "focus_after_coarse": float(arm['focus_after_coarse']) if arm.get('focus_after_coarse') is not None else None,
-            "focus_after_fine": float(arm['focus_after_fine']) if arm.get('focus_after_fine') is not None else None,
-            "times_selected": int(times_selected),
-            "mean_similarity": float(arm['mean_sim']),
-            "variance": float(arm['variance']),
-            "samples_count": int(arm['samples'])
-        }
-        arms_info["arms"].append(arm_info)
-    
-    # Prepare video metadata
-    video_metadata = {
-        "total_frames": int(total_frames),
-        "fps": float(fps),
-        "duration_seconds": float(total_frames / max(1.0, fps)),
-        "budget_used": int(budget_used)
-    }
-    
-    return {
-        "coarse_sampling": coarse_sampling,
-        "fine_sampling": fine_sampling,
-        "arms_info": arms_info,
-        "arm_selection_probabilities": [float(prob) for prob in arm_selection_probs],
-        "final_selected_frames": [int(idx) for idx in selected_frames],
-        "video_metadata": video_metadata
-    }
+    return similarity_fn
 
 
 # ============================================================================
@@ -295,10 +140,48 @@ def ray_worker(dp_rank: int, output_json_base_prefix: str, data_slice, args_dict
                 total_frames = len(vr)
                 video_duration = float(total_frames) / max(1.0, fps)
 
-                selected, sampling_details = process_single_video(
-                    vr, text, vis_processors, text_processors, model, device, args, rng
+                # Adaptive min-gap calculation
+                avg_spacing_sec = video_duration / max(1, args.num_keyframes)
+                if avg_spacing_sec <= float(args.disable_gap_below_sec):
+                    auto_min_gap_sec = 0.0
+                else:
+                    gap_from_ratio = float(args.gap_ratio_of_avg) * avg_spacing_sec
+                    auto_min_gap_sec = min(gap_from_ratio, float(args.min_gap_sec))
+
+                # Create BLIP similarity function
+                similarity_fn = create_blip_similarity_fn(
+                    vr, vis_processors, text_processors, model, device, args.batch_size
                 )
-                budget_used = sampling_details["coarse_sampling"]["budget_used"]
+
+                # Create FOCUS instance
+                focus = FOCUS(
+                    similarity_fn=similarity_fn,
+                    coarse_every_sec=args.coarse_every_sec,
+                    fine_every_sec=args.fine_every_sec,
+                    zoom_ratio=args.zoom_ratio,
+                    final_min_arms=args.final_min_arms,
+                    final_max_arms=args.final_max_arms,
+                    min_coarse_segments=args.min_coarse_segments,
+                    min_zoom_segments=args.min_zoom_segments,
+                    extra_samples_per_region=args.extra_samples_per_region,
+                    min_variance_threshold=args.min_variance_threshold,
+                    fine_uniform_ratio=args.fine_uniform_ratio,
+                    interpolation_method=args.interpolation_method,
+                    top_ratio=args.top_ratio,
+                    temperature=args.temperature,
+                    region_half_window_sec=args.region_half_window_sec
+                )
+
+                # Select keyframes using FOCUS algorithm
+                selected, sampling_details = focus.select_keyframes(
+                    video=vr,
+                    query=text,
+                    k=args.num_keyframes,
+                    min_gap_sec=auto_min_gap_sec,
+                    rng=rng
+                )
+
+                budget_used = sampling_details["video_metadata"]["budget_used"]
 
             results.append({"original_idx": original_idx, "selected_frames": [int(x) for x in selected]})
             budget_stats.append({
